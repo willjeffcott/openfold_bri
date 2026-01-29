@@ -1681,6 +1681,169 @@ def chain_center_of_mass_loss(
     loss = masked_mean(loss_mask, losses, dim=(-1, -2))
     return loss
 
+# In openfold/utils/loss.py
+
+def compute_bri_loss(pred_coords, true_coords, mask):
+    """
+    Inputs:
+        pred_coords: [Batch, N_res, 37, 3] (Predicted atom positions)
+        true_coords: [Batch, N_res, 37, 3] (Ground truth positions)
+        mask:        [Batch, N_res] (1 for valid residues, 0 for missing/padding)
+    """
+    # 1. Extract Backbone Atoms (Standard AlphaFold encoding: 0=N, 1=CA, 2=C)
+    # Shape becomes [Batch, N_res, 3]
+    pred_n  = pred_coords[:, :, 0, :]
+    pred_ca = pred_coords[:, :, 1, :]
+    pred_c  = pred_coords[:, :, 2, :]
+    
+    true_n  = true_coords[:, :, 0, :]
+    true_ca = true_coords[:, :, 1, :]
+    true_c  = true_coords[:, :, 2, :]
+
+    # 2. BRI Torch
+    # produces bri_pred and bri_true from pred_n, pred_ca, pred_c and true_n, true_ca, true_c
+    
+    def bri_torch(n, ca, c):
+        """
+        Compute Backbone Reference Frame (BRI) for given N, CA, C positions.
+        
+        Inputs:
+            n:  [Batch, N_res, 3]
+            ca: [Batch, N_res, 3]
+            c:  [Batch, N_res, 3]
+        Outputs:
+            bri: [Batch, N_res, 9]
+
+        """
+
+        # 2. YOUR MATH GOES HERE (PyTorch Only!)
+    
+        def compute_basis(n, ca, c, epsilon=1e-6):
+            """
+            Computes the orthonormal basis (u, v, w) for each residue i according to Definition 3.4.
+            Origin is at A_i (CA).
+            u_i = normalized(A_i -> N_i)
+            v_i = normalized component of (A_i -> C_i) orthogonal to u_i
+            w_i = u_i x v_i
+            """
+            # Vector A_i -> N_i
+            v_an = n - ca
+            # Vector A_i -> C_i
+            v_ac = c - ca
+
+            # u_i: Unit vector along A_i -> N_i [cite: 169]
+            u_norm = torch.norm(v_an, dim=-1, keepdim=True) + epsilon
+            u = v_an / u_norm
+
+            # Projection of A_i -> C_i onto u_i to find orthogonal component h_i [cite: 170]
+            # b_i * vector(A_iN_i) is equivalent to projection scalar * u_i
+            dot_ac_u = torch.sum(v_ac * u, dim=-1, keepdim=True)
+            h = v_ac - (dot_ac_u * u)
+
+            # v_i: Unit vector of h_i [cite: 169]
+            h_norm = torch.norm(h, dim=-1, keepdim=True) + epsilon
+            v = h / h_norm
+
+            # w_i: Cross product u_i x v_i [cite: 172]
+            w = torch.cross(u, v, dim=-1)
+        
+            return u, v, w, u_norm, dot_ac_u, h_norm
+
+        def project_vector(vec, basis_u, basis_v, basis_w):
+            """Projects a vector onto a basis frame (u, v, w)."""
+            x = torch.sum(vec * basis_u, dim=-1, keepdim=True)
+            y = torch.sum(vec * basis_v, dim=-1, keepdim=True)
+            z = torch.sum(vec * basis_w, dim=-1, keepdim=True)
+            return torch.cat([x, y, z], dim=-1)
+
+        # --- Compute BRI for given structures ---
+        # Compute basis for every residue i
+        p_u, p_v, p_w, p_an_len, p_ac_proj_x, p_ac_proj_y = compute_basis(n, ca, c)
+    
+        # --- Construct Row 1 (i=1) [cite: 174] ---
+        # Definition 3.4: First row is x(N1), x(C1), y(C1) followed by zeros.
+        # x(N1) = |A1N1|; x(C1) = projection of A1C1 on A1N1; y(C1) = height of triangle.
+        p_row1_feats = torch.cat([
+            p_an_len,      # x(A1N1)
+            p_ac_proj_x,   # x(A1C1)
+            p_ac_proj_y,   # y(A1C1)
+        ], dim=-1)
+        # Pad remaining 6 columns with zeros to make it 9-dim
+        p_row1_padded = torch.cat([p_row1_feats, torch.zeros_like(p_row1_feats).repeat(1, 1, 2)], dim=-1)
+
+        # --- Construct Rows 2..m (i=2..m) [cite: 172] ---
+        # Need vectors relative to basis i-1.
+        # We slice tensors to align index i (current) with i-1 (prev).
+        # Current atoms (i from 1 to m-1):
+        p_n_curr  = pred_n[:, 1:, :]
+        p_ca_curr = pred_ca[:, 1:, :]
+        p_c_curr  = pred_c[:, 1:, :]
+        # Previous atoms (i-1 from 0 to m-2):
+        p_c_prev  = pred_c[:, :-1, :] # Needed for C_{i-1} -> N_i bond
+    
+        # Previous Basis frames (i-1):
+        p_u_prev = p_u[:, :-1, :]
+        p_v_prev = p_v[:, :-1, :]
+        p_w_prev = p_w[:, :-1, :]
+
+        # Vectors required by Definition 3.4 for rows i > 1:
+        # 1. Vector C_{i-1} -> N_i [cite: 172]
+        vec_cn_link = p_n_curr - p_c_prev
+        # 2. Vector N_i -> A_i [cite: 172]
+        vec_na_bond = p_ca_curr - p_n_curr
+        # 3. Vector A_i -> C_i [cite: 172]
+        vec_ac_bond = p_c_curr - p_ca_curr
+
+        # Project these vectors onto the basis of residue i-1
+        feat_cn = project_vector(vec_cn_link, p_u_prev, p_v_prev, p_w_prev)
+        feat_na = project_vector(vec_na_bond, p_u_prev, p_v_prev, p_w_prev)
+        feat_ac = project_vector(vec_ac_bond, p_u_prev, p_v_prev, p_w_prev)
+
+        # Concatenate to form the 9-dim vector for each residue i > 1
+        p_rows_rest = torch.cat([feat_cn, feat_na, feat_ac], dim=-1)
+
+        # Combine Row 1 (slice index 0) and Rows 2..m (slice indices 1..m)
+        # Note: We must slice p_row1_padded to keep dimension [B, 1, 9]
+        bri = torch.cat([p_row1_padded[:, :1, :], p_rows_rest], dim=1)
+
+        return bri
+
+    bri_pred = bri_torch(pred_n, pred_ca, pred_c)  # [Batch, N_res, 9]
+    bri_true = bri_torch(true_n, true_ca, true_c)  # [Batch, N_res, 9]
+
+    # ----------------------------------------------
+    
+    # 3. Compute the Difference (L1 or L2 loss)
+    # The paper suggests L_inf metric (Max abs diff) for strict invariance checking[cite: 382].
+    # However, for loss gradients, L1 (MAE) or L2 (MSE) is usually preferred.
+
+    # Go with L2 Loss here:
+    diff = (bri_pred - bri_true) ** 2  # L2
+    #diff = torch.abs(bri_pred - bri_true) # L1 Loss
+
+    # 4. Apply Mask (Critical!)
+    # Update mask for BRI validity:
+    # Row i is valid only if Residue i AND Residue i-1 are valid (because it uses basis i-1).
+    # Row 1 is valid if Residue 1 is valid.
+    
+    # mask: [Batch, N_res]
+    mask_curr = mask[:, 1:]   # Residues 2..N
+    mask_prev = mask[:, :-1]  # Residues 1..N-1
+    mask_rest = mask_curr * mask_prev # Both must be present for valid inter-residue geometry
+    
+    # Combine mask for Row 1 and Rows 2..N
+    bri_mask_valid = torch.cat([mask[:, :1], mask_rest], dim=1)
+    
+    # Expand mask to match diff dimensions [Batch, N_res, 9]
+    mask_expanded = bri_mask_valid.unsqueeze(-1)
+    loss_masked = diff * mask_expanded
+    
+    # 5. Normalize
+    # Sum of errors divided by sum of valid residues * 9 dimensions
+    loss_scalar = torch.sum(loss_masked) / (torch.sum(mask_expanded) + 1e-6)
+    
+    return loss_scalar
+
 
 class AlphaFoldLoss(nn.Module):
     """Aggregation of the various losses described in the supplement"""
@@ -1740,6 +1903,11 @@ class AlphaFoldLoss(nn.Module):
             "violation": lambda: violation_loss(
                 out["violation"],
                 **{**batch, **self.config.violation},
+            ),
+            "bri_loss": lambda: compute_bri_loss(
+                out["final_atom_positions"], 
+                batch["all_atom_positions"], 
+                batch["all_atom_mask"]
             ),
         }
 

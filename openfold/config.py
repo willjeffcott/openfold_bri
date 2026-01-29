@@ -750,6 +750,9 @@ config = mlc.ConfigDict(
                 "eps": 1e-4,
                 "weight": 1.0,
             },
+            "bri_loss": {
+                "weight": 0.1,  # Adjust this based on magnitude relative to FAPE
+            },
             "plddt_loss": {
                 "min_resolution": 0.1,
                 "max_resolution": 3.0,
