@@ -1700,112 +1700,77 @@ def compute_bri_loss(pred_coords, true_coords, mask):
     true_ca = true_coords[:, :, 1, :]
     true_c  = true_coords[:, :, 2, :]
 
-    # 2. BRI Torch
-    # produces bri_pred and bri_true from pred_n, pred_ca, pred_c and true_n, true_ca, true_c
-    
+    # ==========================================
+    # 1. PYTORCH BRI IMPLEMENTATION
+    # ==========================================
     def bri_torch(n, ca, c):
         """
-        Compute Backbone Reference Frame (BRI) for given N, CA, C positions.
-        
-        Inputs:
-            n:  [Batch, N_res, 3]
-            ca: [Batch, N_res, 3]
-            c:  [Batch, N_res, 3]
-        Outputs:
-            bri: [Batch, N_res, 9]
-
+        Computes BRI from coordinates (PyTorch version).
         """
-
-        # 2. YOUR MATH GOES HERE (PyTorch Only!)
-    
-        def compute_basis(n, ca, c, epsilon=1e-6):
-            """
-            Computes the orthonormal basis (u, v, w) for each residue i according to Definition 3.4.
-            Origin is at A_i (CA).
-            u_i = normalized(A_i -> N_i)
-            v_i = normalized component of (A_i -> C_i) orthogonal to u_i
-            w_i = u_i x v_i
-            """
-            # Vector A_i -> N_i
+        epsilon = 1e-6
+        
+        def compute_basis(n, ca, c):
             v_an = n - ca
-            # Vector A_i -> C_i
             v_ac = c - ca
-
-            # u_i: Unit vector along A_i -> N_i [cite: 169]
+            
             u_norm = torch.norm(v_an, dim=-1, keepdim=True) + epsilon
             u = v_an / u_norm
-
-            # Projection of A_i -> C_i onto u_i to find orthogonal component h_i [cite: 170]
-            # b_i * vector(A_iN_i) is equivalent to projection scalar * u_i
+            
             dot_ac_u = torch.sum(v_ac * u, dim=-1, keepdim=True)
             h = v_ac - (dot_ac_u * u)
-
-            # v_i: Unit vector of h_i [cite: 169]
             h_norm = torch.norm(h, dim=-1, keepdim=True) + epsilon
             v = h / h_norm
-
-            # w_i: Cross product u_i x v_i [cite: 172]
+            
             w = torch.cross(u, v, dim=-1)
-        
-            return u, v, w, u_norm, dot_ac_u, h_norm
+            return u, v, w
 
         def project_vector(vec, basis_u, basis_v, basis_w):
-            """Projects a vector onto a basis frame (u, v, w)."""
             x = torch.sum(vec * basis_u, dim=-1, keepdim=True)
             y = torch.sum(vec * basis_v, dim=-1, keepdim=True)
             z = torch.sum(vec * basis_w, dim=-1, keepdim=True)
             return torch.cat([x, y, z], dim=-1)
 
-        # --- Compute BRI for given structures ---
-        # Compute basis for every residue i
-        p_u, p_v, p_w, p_an_len, p_ac_proj_x, p_ac_proj_y = compute_basis(n, ca, c)
-    
-        # --- Construct Row 1 (i=1) [cite: 174] ---
-        # Definition 3.4: First row is x(N1), x(C1), y(C1) followed by zeros.
-        # x(N1) = |A1N1|; x(C1) = projection of A1C1 on A1N1; y(C1) = height of triangle.
-        p_row1_feats = torch.cat([
-            p_an_len,      # x(A1N1)
-            p_ac_proj_x,   # x(A1C1)
-            p_ac_proj_y,   # y(A1C1)
-        ], dim=-1)
-        # Pad remaining 6 columns with zeros to make it 9-dim
-        p_row1_padded = torch.cat([p_row1_feats, torch.zeros_like(p_row1_feats).repeat(1, 1, 2)], dim=-1)
+        p_u, p_v, p_w = compute_basis(n, ca, c)
 
-        # --- Construct Rows 2..m (i=2..m) [cite: 172] ---
-        # Need vectors relative to basis i-1.
-        # We slice tensors to align index i (current) with i-1 (prev).
-        # Current atoms (i from 1 to m-1):
-        p_n_curr  = pred_n[:, 1:, :]
-        p_ca_curr = pred_ca[:, 1:, :]
-        p_c_curr  = pred_c[:, 1:, :]
-        # Previous atoms (i-1 from 0 to m-2):
-        p_c_prev  = pred_c[:, :-1, :] # Needed for C_{i-1} -> N_i bond
-    
-        # Previous Basis frames (i-1):
-        p_u_prev = p_u[:, :-1, :]
-        p_v_prev = p_v[:, :-1, :]
-        p_w_prev = p_w[:, :-1, :]
+        # Row 1 (Project Res 0 onto Basis 0)
+        u0, v0, w0 = p_u[:, :1, :], p_v[:, :1, :], p_w[:, :1, :]
+        n0, ca0, c0 = n[:, :1, :], ca[:, :1, :], c[:, :1, :]
+        
+        vec_n0 = n0 - ca0
+        vec_ca0 = ca0 - ca0
+        vec_c0 = c0 - ca0
+        
+        feat_n0  = project_vector(vec_n0, u0, v0, w0)
+        feat_ca0 = project_vector(vec_ca0, u0, v0, w0)
+        feat_c0  = project_vector(vec_c0, u0, v0, w0)
+        
+        p_row1 = torch.cat([feat_n0, feat_ca0, feat_c0], dim=-1)
 
-        # Vectors required by Definition 3.4 for rows i > 1:
-        # 1. Vector C_{i-1} -> N_i [cite: 172]
-        vec_cn_link = p_n_curr - p_c_prev
-        # 2. Vector N_i -> A_i [cite: 172]
-        vec_na_bond = p_ca_curr - p_n_curr
-        # 3. Vector A_i -> C_i [cite: 172]
-        vec_ac_bond = p_c_curr - p_ca_curr
+        # Rows 2..N (Project Res i onto Basis i-1)
+        n_curr  = n[:, 1:, :]
+        ca_curr = ca[:, 1:, :]
+        c_curr  = c[:, 1:, :]
+        
+        u_prev = p_u[:, :-1, :]
+        v_prev = p_v[:, :-1, :]
+        w_prev = p_w[:, :-1, :]
+        c_prev = c[:, :-1, :]
+        
+        vec_n_curr  = n_curr - c_prev
+        vec_ca_curr = ca_curr - n_curr
+        vec_c_curr  = c_curr - ca_curr
+        
+        feat_n_curr  = project_vector(vec_n_curr, u_prev, v_prev, w_prev)
+        feat_ca_curr = project_vector(vec_ca_curr, u_prev, v_prev, w_prev)
+        feat_c_curr  = project_vector(vec_c_curr, u_prev, v_prev, w_prev)
+        
+        p_rows_rest = torch.cat([feat_n_curr, feat_ca_curr, feat_c_curr], dim=-1)
 
-        # Project these vectors onto the basis of residue i-1
-        feat_cn = project_vector(vec_cn_link, p_u_prev, p_v_prev, p_w_prev)
-        feat_na = project_vector(vec_na_bond, p_u_prev, p_v_prev, p_w_prev)
-        feat_ac = project_vector(vec_ac_bond, p_u_prev, p_v_prev, p_w_prev)
-
-        # Concatenate to form the 9-dim vector for each residue i > 1
-        p_rows_rest = torch.cat([feat_cn, feat_na, feat_ac], dim=-1)
-
-        # Combine Row 1 (slice index 0) and Rows 2..m (slice indices 1..m)
-        # Note: We must slice p_row1_padded to keep dimension [B, 1, 9]
-        bri = torch.cat([p_row1_padded[:, :1, :], p_rows_rest], dim=1)
-
+        bri = torch.cat([p_row1, p_rows_rest], dim=1)
+        
+        # Round to 3 decimal places
+        bri = torch.round(bri * 1000) / 1000.0
+        
         return bri
 
     bri_pred = bri_torch(pred_n, pred_ca, pred_c)  # [Batch, N_res, 9]
